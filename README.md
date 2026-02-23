@@ -1,26 +1,58 @@
-# 🎬 Media DNA: Semantic Movie Search Engine
+# 🎬 MediaDNA: Semantic Search & Autonomous Discovery Engine
 
-Media DNA is an AI-powered cinematic search engine. Instead of relying on rigid genres or basic keyword matching, this project uses Large Language Models (LLMs) and Vector Embeddings to search movies based on their **emotional and stylistic DNA** (e.g., "brooding," "visceral," "opulent").
+MediaDNA is an intelligent movie exploration platform that moves beyond rigid keyword matching. It understands the emotional and stylistic "DNA" of cinema, allowing users to find movies based on "vibe," atmosphere, and semantic similarity.
 
-## 🧠 Architecture & Data Flow
+The core of the system is a **Multi-Agent Orchestrator** that handles everything from fuzzy search logic to autonomous metadata synthesis for new entries.
+
+## 🧠 Key Features
+
+* **Semantic DNA Search**: Uses local vector embeddings (`all-MiniLM-L6-v2`) to find movies based on abstract concepts (e.g., "gritty," "frantic," "bleak") rather than just genres.
+* **Autonomous Discovery Agent**: If a movie is missing from the local database, an agentic workflow triggers:
+    * **Gemini Spellcheck**: Corrects user typos and validates if the query is a real movie.
+    * **Metadata Ingestion**: Fetches official data and posters via TMDB API.
+    * **DNA Synthesis**: Gemini 2.0 Flash analyzes the plot to generate 5 core "DNA" keywords.
+    * **Vectorization**: Encodes the new data into the vector space and updates the Parquet DB in real-time.
+* **Hybrid Matching Logic**: Combines character-level string distance (`difflib`) for title typos with Cosine Similarity for semantic recommendations.
+* **DNA Glossary**: A dynamic UI component that translates abstract DNA terms into human-readable definitions.
+
+## 🏗️ Technical Architecture
+
+The project follows a strict **Separation of Concerns** to ensure scalability and maintainability:
+
+* **`app.py`**: The Streamlit interface and Session State manager.
+* **`search_agent.py`**: The "Brains" of the system—handles string similarity and vector math.
+* **`enrich_db.py`**: The Agent Orchestrator—handles API communication with Gemini and TMDB.
+* **`db_manager.py`**: The Data Access Layer (DAL) for the Apache Parquet local database.
+* **`bulk_enrichment.py`**: A batch processing script for large-scale data ingestion and healing.
 
 
-
-This project implements a self-healing data enrichment pipeline and a semantic search interface:
-1. **Data Acquisition:** Movie metadata is pulled from the TMDB API.
-2. **AI Enrichment (Gemini 2.0 Flash):** Standard descriptions are sent to an LLM with strict zero-shot prompt engineering to extract pure cinematic "DNA" while ignoring traditional genre labels.
-3. **Vectorization (SentenceTransformers):** The `all-MiniLM-L6-v2` model converts the text DNA into 384-dimensional dense vectors.
-4. **Storage (Polyglot Persistence):** Vectors and metadata are stored in a highly compressed `.parquet` file for lightning-fast linear scans in memory, avoiding the overhead of a traditional RDBMS.
-5. **Search:** User queries are vectorized on the fly, and results are ranked using Cosine Similarity.
-
-## ✨ Key Features
-* **Zero-Shot AI Tagging:** Completely automated metadata tagging using prompt engineering.
-* **Auto-Discovery:** If a searched movie isn't in the database, the system fetches it, analyzes its DNA, vectorizes it, and appends it to the Parquet file in real-time.
-* **Self-Healing Glossary:** An autonomous script (`build_glossary.py`) periodically analyzes the vector database for new, complex vocabulary and uses AI to generate dictionary definitions for the UI.
-* **Infinite Carousel UI:** Built natively in Streamlit with mathematical index wrapping for seamless browsing.
 
 ## 🛠️ Tech Stack
-* **Frontend/Backend:** Streamlit, Python
-* **AI/Embeddings:** Google GenAI (Gemini), HuggingFace (`sentence-transformers`)
-* **Data Manipulation & Math:** Pandas, NumPy, scikit-learn
-* **Storage:** Parquet, JSON (Glossary)
+
+* **Language**: Python 3.9+
+* **AI Models**: Gemini 2.0 Flash (Reasoning), SentenceTransformers (Embeddings).
+* **Database**: Apache Parquet (Columnar storage).
+* **APIs**: The Movie Database (TMDB).
+* **UI**: Streamlit.
+
+## 🚀 Installation & Setup
+
+1. **Clone the Repo**:
+   ```bash
+   git clone [https://github.com/your-username/MediaDNA.git](https://github.com/your-username/MediaDNA.git)
+   cd MediaDNA
+
+2. **Install Dependencies**:
+   ```bash
+   pip install -r requirements.txt
+
+3. **Configure Secrets**:
+   Create `.streamlit/secrets.toml`:
+   ```toml
+   TMDB_API_KEY = "your_tmdb_key"
+   GEMINI_API_KEY = "your_gemini_key"
+
+4. **Run the App**:
+   ```bash
+   streamlit run app.py
+   

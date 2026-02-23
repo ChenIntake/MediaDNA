@@ -1,204 +1,146 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
-import re
-from sentence_transformers import SentenceTransformer
-from google.genai import Client
-from sklearn.metrics.pairwise import cosine_similarity
-
-# --- Configuration & Auth ---
-st.set_page_config(page_title="Media DNA", layout="wide")
-
-# Glossary for "Fancy" DNA terms
 import json
-import os
+from sentence_transformers import SentenceTransformer
+
+import db_manager
+import search_agent
+import enrich_db
+
+# --- Page Config ---
+st.set_page_config(page_title="MediaDNA", layout="wide")
+
+# --- Load Global Resources ---
+@st.cache_resource
+def load_model():
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
 @st.cache_data
 def load_glossary():
-    if os.path.exists("glossary.json"):
-        with open("glossary.json", "r") as f:
-            # Convert keys to lowercase just to be safe
-            return {k.lower(): v for k, v in json.load(f).items()}
-    return {}
-
-# Call this alongside your load_data()
-GLOSSARY = load_glossary()
-
-try:
-    TMDB_API_KEY = st.secrets["TMDB_API_KEY"]
-    client = Client(api_key=st.secrets["GEMINI_API_KEY"])
-except Exception:
-    import toml
-    secrets = toml.load(".streamlit/secrets.toml")
-    TMDB_API_KEY = secrets["TMDB_API_KEY"]
-    client = Client(api_key=secrets["GEMINI_API_KEY"])
-
-@st.cache_resource
-def load_models():
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-embed_model = load_models()
-
-# --- Core Functions ---
-@st.cache_data
-def load_data():
+    """Loads the DNA dictionary. Fails gracefully if file doesn't exist."""
     try:
-        df = pd.read_parquet('movie_data.parquet')
-        embeddings = np.stack(df['embedding'].values)
-        return df, embeddings
+        with open('glossary.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
     except FileNotFoundError:
-        st.error("Database missing.")
-        st.stop()
-# TMDB Genre Mapping to avoid redundant API calls
-TMDB_GENRES = {
-    28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 
-    99: "Documentary", 18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History", 
-    27: "Horror", 10402: "Music", 9648: "Mystery", 10749: "Romance", 
-    878: "Science Fiction", 10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western"
-}
+        return {}
 
-def fetch_tmdb_info(query):
-    """Fetches official title, overview, and genres from TMDB."""
-    url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={query}"
-    try:
-        res = requests.get(url).json()
-        if res.get('results'):
-            movie = res['results'][0]
-            title = movie.get('original_title', query)
-            overview = movie.get('overview', '')
-            genres = ", ".join([TMDB_GENRES.get(g, "") for g in movie.get('genre_ids', []) if g in TMDB_GENRES])
-            return title, overview, genres
-    except Exception:
-        pass
-    return query, "", ""
+embed_model = load_model()
+df = db_manager.load_db()
+glossary = load_glossary()
 
-def get_dna_from_ai(title, overview):
-    prompt = f"""
-    Analyze the emotional and stylistic 'DNA' of the movie '{title}'. 
-    Context: {overview if overview else 'No description available.'}.
-    Return 5-7 keywords describing the tone, vibe, and aesthetic.
-    
-    CRITICAL RULES:
-    1. DO NOT use genre names.
-    2. BE OBJECTIVE: Describe the vibe, not the quality.
-    3. NO EXPLANATIONS. NO INTRODUCTIONS.
-    
-    OUTPUT FORMAT:
-    Return exactly 5 keywords separated by spaces.
-    
-    Keywords:
-    """
-    try:
-        res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-        dna_text = res.text.strip().lower()
-        # Clean potential headers or punctuation
-        dna_text = dna_text.replace('keywords:', '').replace('.', '').replace(',', ' ')
-        dna_text = re.sub(r'\band\b', '', dna_text, flags=re.IGNORECASE)
-        return re.sub(r'\s+', ' ', dna_text).strip()
-    except Exception:
-        return ""
-
-def get_poster_url(title):
-    url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={title}"
-    try:
-        res = requests.get(url).json()
-        if res['results'] and res['results'][0].get('poster_path'):
-            return f"https://image.tmdb.org/t/p/w500{res['results'][0]['poster_path']}"
-    except: pass
-    return "https://via.placeholder.com/500x750?text=No+Poster"
-
-# --- App State & Data ---
-df, embeddings = load_data()
-
-# Initialize session state for pagination
-if 'recommendation_count' not in st.session_state:
-    st.session_state.recommendation_count = 5
-
-st.title("🎬 Media DNA")
-st.markdown("Search by aesthetic vibe. If a movie isn't in our DB, we'll analyze it on the fly.")
-
-# --- Search with Auto-suggestions ---
-# We use st.selectbox as a searchable input field
-movie_list = sorted(df['original_title'].unique().tolist())
-query = st.selectbox("Search for a movie or type a new one:", 
-                     options=[""] + movie_list, 
-                     format_func=lambda x: "Select a movie..." if x == "" else x)
-
-# Trigger search
-if query != "":
-    with st.spinner(f"Analyzing '{query}'..."):
-        # 1. Logic to get/create DNA
-        match = df[df['original_title'].str.lower() == query.lower()]
-        
-        if not match.empty and pd.notna(match.iloc[0].get('dna', '')) and match.iloc[0].get('dna', '') != "":
-            target_dna = match.iloc[0]['dna']
-            query_vec = embeddings[match.index[0]]
-            official_title = match.iloc[0]['original_title']
+# --- Helper: Translate DNA ---
+def interpret_dna(dna_string, gloss_dict):
+    if not dna_string: return ""
+    words = dna_string.split()
+    interpreted = []
+    for w in words:
+        meaning = gloss_dict.get(w.lower())
+        if meaning:
+            interpreted.append(f"**{w}** ({meaning})")
         else:
-            # Auto-discovery if movie is missing
-            official_title, overview, genres = fetch_tmdb_info(query) # (Assuming fetch_tmdb_info is defined)
-            target_dna = get_dna_from_ai(official_title, overview)
-            combined_text = f"{target_dna} {official_title}".strip()
-            query_vec = embed_model.encode([combined_text])[0]
-            # ... (Logic to save to parquet would go here as previously discussed)
+            interpreted.append(f"**{w}**")
+    return " | ".join(interpreted)
 
-        st.info(f"**Vibe Profile for {official_title}:** {target_dna}")
-        
-        # --- 2. Vector Search ---
-        similarities = cosine_similarity([query_vec], embeddings)[0]
-        
-        # Exclude original movie and sort
-        query_idx = df[df['original_title'] == official_title].index[-1]
-        sorted_indices = [idx for idx in similarities.argsort()[::-1] if idx != query_idx]
-        
-        # --- 3. Infinite Carousel Pagination ---
-        if 'carousel_idx' not in st.session_state:
-            st.session_state.carousel_idx = 0
+# --- Helper: Render Movie Card (UI) ---
+def render_movie_card(movie_dict, match_score=None, button_key=None):
+    """Encapsulates the UI logic for displaying a movie (Poster + Text)"""
+    col1, col2 = st.columns([1, 5])
+    
+    with col1:
+        if movie_dict.get('poster_url'):
+            st.image(movie_dict['poster_url'], width='stretch')
+        else:
+            st.info("🎬 No Poster")
             
-        total_matches = len(sorted_indices)
-        
-        st.subheader("Top Semantic Matches")
-        
-        # Navigation UI
-        col_prev, col_space, col_next = st.columns([1, 8, 1])
-        
-        with col_prev:
-            if st.button("⬅️ Prev"):
-                # Move back 5, wrap to the end if we hit 0
-                st.session_state.carousel_idx -= 5
-                if st.session_state.carousel_idx < 0:
-                    remainder = total_matches % 5
-                    st.session_state.carousel_idx = total_matches - (remainder if remainder else 5)
-                    
-        with col_next:
-            if st.button("Next ➡️"):
-                # Move forward 5, wrap to 0 if we exceed total
-                st.session_state.carousel_idx += 5
-                if st.session_state.carousel_idx >= total_matches:
-                    st.session_state.carousel_idx = 0
-                    
-        # Slice the array for the current view
-        current_slice = sorted_indices[st.session_state.carousel_idx : st.session_state.carousel_idx + 5]
-
-        # --- 4. Render Results ---
-        cols = st.columns(5)
-        for i, idx in enumerate(current_slice):
-            movie = df.iloc[int(idx)]
-            score = similarities[idx]
-            poster = get_poster_url(movie['original_title'])
+    with col2:
+        title = movie_dict['original_title']
+        if match_score is not None:
+            title += f" 🎯 (Match: {match_score:.2f})"
             
-            with cols[i]:
-                st.image(poster, use_container_width=True)
-                st.markdown(f"**{movie['original_title']}** \n`Match: {score:.1%}`")
+        st.subheader(title)
+        st.write(movie_dict['overview'])
+        
+        interpreted_dna = interpret_dna(movie_dict.get('dna', ''), glossary)
+        st.caption(f"🧬 **DNA:** {interpreted_dna}")
+        
+        if button_key:
+            if st.button("Select This Movie", key=button_key):
+                st.session_state.selected_movie = movie_dict
+                st.rerun()
                 
-                with st.expander("DNA & Glossary"):
-                    dna_list = str(movie['dna']).split()
-                    explained_dna = []
-                    for word in dna_list:
-                        if word.lower() in GLOSSARY:
-                            explained_dna.append(f"**{word}** ({GLOSSARY[word.lower()]})")
-                        else:
-                            explained_dna.append(word)
-                    
-                    st.markdown(" / ".join(explained_dna))
+    st.divider()
+
+# --- Initialize Session State ---
+if 'selected_movie' not in st.session_state: st.session_state.selected_movie = None
+if 'enrich_query' not in st.session_state: st.session_state.enrich_query = None
+
+# --- UI Header ---
+st.title("🎬 MediaDNA: Semantic Search & Auto-Discovery")
+
+# --- Search Logic ---
+query = st.text_input("🔍 Search for a movie (typos allowed!):", placeholder="e.g. forrst gamp...")
+
+if query:
+    if 'last_query' not in st.session_state or st.session_state.last_query != query:
+        st.session_state.selected_movie = None
+        st.session_state.enrich_query = None
+        st.session_state.last_query = query
+
+    matches_df = search_agent.get_title_matches(query, df, embed_model, threshold=0.60)
+    
+    # Display search results ONLY if no movie is currently selected
+    if not matches_df.empty and st.session_state.selected_movie is None:
+        st.write(f"🤔 **Found {len(matches_df)} possible matches in the DB:**")
+        for idx, row in matches_df.iterrows():
+            render_movie_card(row.to_dict(), match_score=row['title_match_score'], button_key=f"sel_{row['original_title']}")
+        
+        st.write("Not what you're looking for?")
+        if st.button("🚀 Search Web & Add New Movie"):
+            st.session_state.enrich_query = query
+            st.rerun()
+    
+    # Trigger enrichment if no results found in DB
+    elif matches_df.empty and st.session_state.selected_movie is None and st.session_state.enrich_query is None:
+        st.warning(f"🛸 '{query}' not found in DB. Ready to search the web.")
+        if st.button("🚀 Search Web & Add New Movie"):
+            st.session_state.enrich_query = query
+            st.rerun()
+
+# --- Enrichment Agent Execution ---
+if st.session_state.enrich_query:
+    with st.spinner(f"Agent Action: Fetching and synthesizing '{st.session_state.enrich_query}'..."):
+        new_record = enrich_db.enrich_single_movie(st.session_state.enrich_query, embed_model)
+        
+        if new_record:
+            db_manager.save_new_movie(new_record)
+            st.success(f"✅ Added '{new_record['original_title']}' to database.")
+            st.session_state.selected_movie = new_record 
+            st.session_state.enrich_query = None 
+            st.rerun()
+        else:
+            st.warning(f"Are you sure? The internet does not agree '{st.session_state.enrich_query}' is a movie.")
+            if st.button("Try a different search"):
+                st.session_state.enrich_query = None
+                st.rerun()
+
+# --- Anchor & Recommendations Display ---
+# This block runs whenever a movie is selected, showing the Anchor above recommendations
+if st.session_state.selected_movie:
+    target = st.session_state.selected_movie
+    
+    st.markdown("---")
+    st.header("📍 Anchor Movie")
+    render_movie_card(target)
+    
+    # Reload DB to ensure newly added movies are included in the search pool
+    current_df = db_manager.load_db() 
+    recs_df = search_agent.get_dna_recommendations(
+        target_embedding=target['embedding'],
+        df=current_df,
+        exclude_title=target['original_title'],
+        top_k=5
+    )
+    
+    if not recs_df.empty:
+        st.header("🎯 Top DNA Matches")
+        for _, row in recs_df.iterrows():
+            render_movie_card(row.to_dict(), match_score=row['dna_match_score'])

@@ -1,26 +1,19 @@
-import pandas as pd
-import numpy as np
-import time
 import requests
-import toml
 import re
-from sentence_transformers import SentenceTransformer
+import time
+import toml
+import json
 from google.genai import Client
+from google.genai import types
 
-# --- Configuration & Setup ---
-BATCH_SIZE = 10
-MAX_MOVIES_TO_PROCESS = 4000 # Will process until API limit is hit or list is done
-MODEL_NAME = 'all-MiniLM-L6-v2'
-
-# Load secrets (Local execution)
+# --- Configuration & Secrets Loading ---
+# We load secrets locally. In Streamlit Cloud, these are managed via the UI.
 secrets = toml.load(".streamlit/secrets.toml")
 TMDB_API_KEY = secrets["TMDB_API_KEY"]
 client = Client(api_key=secrets["GEMINI_API_KEY"])
 
-# Initialize local embedding model
-embed_model = SentenceTransformer(MODEL_NAME)
-
-# TMDB Genre Mapping to avoid redundant API calls
+# Static Genre Mapping:
+# Prevents the need to make a secondary API call to TMDB just to resolve genre IDs.
 TMDB_GENRES = {
     28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 
     99: "Documentary", 18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History", 
@@ -28,26 +21,7 @@ TMDB_GENRES = {
     878: "Science Fiction", 10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western"
 }
 
-def load_db():
-    """Loads the Parquet database and extracts embeddings."""
-    print("[1] Loading Parquet database...")
-    df = pd.read_parquet('movie_data.parquet')
-    
-    # Ensure required columns exist
-    for col in ['overview', 'genres', 'dna']:
-        if col not in df.columns:
-            df[col] = ""
-            
-    embeddings = np.stack(df['embedding'].values) if 'embedding' in df.columns else None
-    return df, embeddings
-
-def save_db(df, embeddings):
-    """Saves the DataFrame and embeddings back to Parquet."""
-    df['embedding'] = list(embeddings)
-    df.to_parquet('movie_data.parquet', engine='pyarrow', index=False)
-
 def fetch_tmdb_info(title):
-    """Fetches movie overview and genres from TMDB API."""
     url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={title}"
     try:
         res = requests.get(url).json()
@@ -55,14 +29,23 @@ def fetch_tmdb_info(title):
             movie_data = res['results'][0]
             overview = movie_data.get('overview', '')
             genre_ids = movie_data.get('genre_ids', [])
+            
+            # Fetch Poster URL (TMDB returns a relative path)
+            poster_path = movie_data.get('poster_path')
+            poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else ""
+            
             genres_str = ", ".join([TMDB_GENRES.get(g_id, "") for g_id in genre_ids if g_id in TMDB_GENRES])
-            return overview, genres_str
+            return overview, genres_str, movie_data.get('title', title), poster_url
     except Exception as e:
-        print(f"    [!] TMDB Error for '{title}': {e}")
-    return "", ""
+        print(f"[!] TMDB Connection Error for '{title}': {e}")
+        
+    return "", "", title, ""
 
 def get_dna_keywords(title, overview, retries=3):
-    """Generates semantic DNA using LLM with exponential backoff for rate limits."""
+    """
+    Generates semantic DNA using LLM with Safety bypass, 
+    regex cleanup, and robust error handling.
+    """
     prompt = f"""
     Analyze the emotional and stylistic 'DNA' of the movie '{title}'. 
     Context: {overview if overview else 'No description available.'}.
@@ -74,136 +57,122 @@ def get_dna_keywords(title, overview, retries=3):
     
     OUTPUT FORMAT:
     Return exactly 5 keywords separated by spaces.
-    Example: gritty dark cynical urban industrial
-    
-    Keywords:
     """
+    
+    for attempt in range(retries):
+        try:
+            # 1. הגדרות בטיחות (הסרת כפפות)
+            safe_config = types.GenerateContentConfig(
+                safety_settings=[
+                    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH)
+                ]
+            )
+            
+            # 2. קריאה למודל
+            res = client.models.generate_content(
+                model='gemini-2.0-flash', 
+                contents=prompt,
+                config=safe_config
+            )
+            
+            # 3. בדיקה ולידציה שבאמת חזר טקסט (למנוע UnboundLocalError)
+            if not res.candidates or not res.candidates[0].content.parts:
+                print(f"[!] Gemini returned empty content (Likely a hard safety block).")
+                return ""
+                
+            raw_text = res.text
+            
+            # 4. ניקוי אגרסיבי (נקודות, פסיקים, המילה and, ורווחים כפולים)
+            clean_text = re.sub(r'[.,;!\?-]', ' ', raw_text)
+            clean_text = re.sub(r'\band\b', '', clean_text, flags=re.IGNORECASE)
+            
+            return re.sub(r'\s+', ' ', clean_text).strip()
+            
+        except Exception as e:
+            if "429" in str(e) or "exhausted" in str(e).lower():
+                import time
+                time.sleep((attempt + 1) * 2)
+            else:
+                print(f"[!] Gemini Execution Error: {e}")
+                return "" # כישלון שקט ונקי
+                
+    return ""
+
+def spellcheck_with_gemini(raw_query, retries=2):
+    """
+    Uses Gemini to correct movie titles before hitting TMDB.
+    Returns (corrected_title, confidence_score).
+    """
+    prompt = f"""
+    A user searched for a movie using this exact text: "{raw_query}".
+    Identify the correct, official movie title. 
+    If it's total gibberish and definitely not a movie, return an empty string "".
+    
+    Return ONLY a valid JSON object with the keys "official_title" and "confidence" (0-100).
+    Example 1: {{"official_title": "Forrest Gump", "confidence": 99}}
+    Example 2: {{"official_title": "v for vandata", "confidence": 95, "official_title": "V for Vendetta"}}
+    Example 3: {{"official_title": "gdfgfdgd", "confidence": 0}}
+    """
+    
     for attempt in range(retries):
         try:
             res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-            dna_text = res.text.strip()
+            raw_text = res.text.strip()
             
-            # Post-processing: remove commas and conjunctions
-            dna_text = dna_text.replace(',', ' ')
-            dna_text = re.sub(r'\band\b', '', dna_text, flags=re.IGNORECASE)
-            dna_text = re.sub(r'\s+', ' ', dna_text).strip()
+            # Clean up Markdown formatting if Gemini wraps the JSON
+            if raw_text.startswith("```json"): raw_text = raw_text[7:-3]
+            elif raw_text.startswith("```"): raw_text = raw_text[3:-3]
+                
+            data = json.loads(raw_text.strip())
+            return data.get("official_title", ""), data.get("confidence", 0)
             
-            return dna_text
         except Exception as e:
-            error_msg = str(e)
-            if "429" in error_msg or "exhausted" in error_msg.lower():
-                wait_time = (attempt + 1) * 10
-                print(f"    [!] Rate Limit (429). Waiting {wait_time}s before retry {attempt + 1}/{retries}...")
-                time.sleep(wait_time)
+            if "429" in str(e):
+                import time
+                time.sleep(1)
             else:
-                print(f"    [!] Gemini Error for '{title}': {e}")
-                return ""
-    print(f"    [!] Failed to get DNA for '{title}' after {retries} retries.")
-    return ""
-
-def rebuild_vector_index(df):
-    """Rebuilds the mathematical vector space based on the hierarchical formula."""
-    print("\n[4] Rebuilding entire vector index based on: DNA > Genre > Title...")
-    new_embeddings = []
+                print(f"[!] Gemini Spellcheck Error: {e}")
+                return raw_query, 100 # Fallback to original if parsing fails
     
-    def safe_extract(val):
-        if isinstance(val, (list, tuple, np.ndarray)):
-            return " ".join([str(i) for i in val])
-        if str(val) in ['nan', 'None', 'NaN']:
-            return ""
-        return str(val)
+    return "", 0
 
-    for idx, row in df.iterrows():
-        title = safe_extract(row['original_title'])
-        genres = safe_extract(row['genres'])
-        dna = safe_extract(row['dna']).replace(" and ", " ").replace(" And ", " ")
+def enrich_single_movie(query_title, embed_model):
+    """
+    The main Orchestrator function for the Enrichment Agent.
+    """
+    # 0. Gatekeeper: Fix typos via Gemini before asking TMDB
+    corrected_title, confidence = spellcheck_with_gemini(query_title)
+    
+    # If Gemini is sure it's gibberish (under 70%), abort early
+    if confidence < 70 or not corrected_title:
+        print(f"[!] Gatekeeper blocked: '{query_title}' (Confidence: {confidence}%)")
+        return None 
         
-        # Core heuristic: Combine features by priority
-        combined_text = f"{dna} {genres} {title}".strip()
-        df.at[idx, 'combined_features'] = combined_text
-        
-        vec = embed_model.encode([combined_text])[0]
-        new_embeddings.append(vec)
-        
-    return np.array(new_embeddings)
+    print(f"[*] Gatekeeper corrected: '{query_title}' -> '{corrected_title}'")
 
-def run_pipeline():
-    df, embeddings = load_db()
+    # 1. Fetch Metadata using the CORRECTED title
+    overview, genres, official_title, poster_url = fetch_tmdb_info(corrected_title)
     
-    # Selection logic
-    mask = df['dna'].isna() | (df['dna'] == "") | (df['dna'].str.lower() == 'nan')
-    df_to_process = df[mask].head(MAX_MOVIES_TO_PROCESS)
+    if not overview:
+        return None 
+        
+    # 2. Extract semantic DNA
+    dna = get_dna_keywords(official_title, overview)
     
-    # Reporting stats
-    stats = {
-        "total_attempted": len(df_to_process),
-        "success": 0,
-        "failed": 0,
-        "errors": {} # Dictionary to count specific error types
+    # 3. Vectorize the combined features locally
+    combined_text = f"{dna} {genres} {official_title}".strip()
+    embedding = embed_model.encode([combined_text])[0]
+    
+    # 4. Return the packed record
+    return {
+        'original_title': official_title,
+        'overview': overview,
+        'genres': genres,
+        'dna': dna,
+        'combined_features': combined_text,
+        'embedding': embedding,
+        'poster_url': poster_url
     }
-    
-    if df_to_process.empty:
-        print("All movies are fully enriched! Rebuilding index.")
-        embeddings = rebuild_vector_index(df)
-        save_db(df, embeddings)
-        return
-        
-    indices = df_to_process.index.tolist()
-    total_batches = (len(indices) // BATCH_SIZE) + (1 if len(indices) % BATCH_SIZE != 0 else 0)
-    
-    print(f"[2] Starting enrichment for {len(indices)} movies...")
-
-    for batch_num, batch_indices in enumerate([indices[i:i + BATCH_SIZE] for i in range(0, len(indices), BATCH_SIZE)], 1):
-        print(f"\n--- Batch {batch_num}/{total_batches} ---")
-        
-        for idx in batch_indices:
-            title = df.at[idx, 'original_title']
-            print(f"  > Processing: {title}")
-            
-            try:
-                # 1. Fetch metadata
-                overview, genres = fetch_tmdb_info(title)
-                if overview: df.at[idx, 'overview'] = overview
-                if genres: df.at[idx, 'genres'] = genres
-                    
-                # 2. Generate DNA
-                dna = get_dna_keywords(title, overview)
-                
-                if dna:
-                    df.at[idx, 'dna'] = dna
-                    stats["success"] += 1
-                    print(f"    [V] DNA: {dna}")
-                else:
-                    raise Exception("Gemini returned empty DNA (Likely persistent 429)")
-                    
-            except Exception as e:
-                stats["failed"] += 1
-                error_type = str(e).split(":")[0] # Categorize error
-                stats["errors"][error_type] = stats["errors"].get(error_type, 0) + 1
-                print(f"    [X] Failed: {e}")
-                
-            time.sleep(4)
-            
-        save_db(df, embeddings) # Save progress after each batch
-        
-    # Final Summary Log
-    print("\n" + "="*30)
-    print("🚀 ENRICHMENT JOB SUMMARY")
-    print("="*30)
-    print(f"Total Attempted: {stats['total_attempted']}")
-    print(f"Successfully Enriched: {stats['success']} ✅")
-    print(f"Failed: {stats['failed']} ❌")
-    
-    if stats["errors"]:
-        print("\nError Breakdown:")
-        for err, count in stats["errors"].items():
-            print(f" - {err}: {count}")
-    print("="*30)
-
-    # Rebuild vectors only if we have new data
-    if stats["success"] > 0:
-        embeddings = rebuild_vector_index(df)
-        save_db(df, embeddings)
-
-if __name__ == "__main__":
-    run_pipeline()
