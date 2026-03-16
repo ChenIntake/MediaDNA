@@ -73,7 +73,7 @@ def get_dna_keywords(title, overview, retries=3):
             
             # 2. קריאה למודל
             res = client.models.generate_content(
-                model='gemini-2.0-flash', 
+                model='gemini-3.1-flash-lite-preview', 
                 contents=prompt,
                 config=safe_config
             )
@@ -119,7 +119,7 @@ def spellcheck_with_gemini(raw_query, retries=2):
     
     for attempt in range(retries):
         try:
-            res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            res = client.models.generate_content(model='gemini-3.1-flash-lite-preview', contents=prompt)
             raw_text = res.text.strip()
             
             # Clean up Markdown formatting if Gemini wraps the JSON

@@ -68,7 +68,7 @@ for i in range(0, len(words_to_process), BATCH_SIZE):
     """
 
     try:
-        res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+        res = client.models.generate_content(model='gemini-3.1-flash-lite-preview', contents=prompt)
         output = res.text.strip()
         
         # Clean up in case Gemini disobeys and adds markdown

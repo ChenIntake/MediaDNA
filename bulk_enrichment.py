@@ -80,7 +80,7 @@ def get_dna_keywords(title, overview, retries=3):
     """
     for attempt in range(retries):
         try:
-            res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            res = client.models.generate_content(model='gemini-3.1-flash-lite-preview', contents=prompt)
             dna_text = res.text.strip()
             
             # Post-processing: remove commas and conjunctions
